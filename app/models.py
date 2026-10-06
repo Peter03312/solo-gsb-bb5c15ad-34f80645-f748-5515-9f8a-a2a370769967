@@ -79,3 +79,8 @@ class Report(Base):
     # {min_clearance_mm, line_no, point_mm, zone_no, progress,
     #  tool_no, tool_radius_mm} 或 None
     min_clearance = Column(JSON, nullable=True)
+
+    # 多刀模式固化的执行事件轨迹（仅 tool_radii 启用的报告）：
+    # [{seq, kind, line_no, tool_no, tool_radius_mm, start_mm, end_mm,
+    #   hit_zone_no}, ...]；单刀请求与旧报告为 NULL
+    execution_trace = Column(JSON, nullable=True)

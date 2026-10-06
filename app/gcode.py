@@ -14,8 +14,9 @@
 - T 刀号默认解析后忽略（单刀模式，与旧版一致）；当调用方传入
   tool_radius_map（刀号 -> 毫米半径）时启用多刀模式：
   * Tn 必须为非负整数，同一行至多一个 T，且 n 必须在映射中，否则拒绝；
-  * Tn 在其所在行先于运动生效（半径作用于本行运动）；无运动的独立 T 行
-    生成一次静止换刀事件，位置为当前刀位点；
+  * Tn 在其所在行先于运动生效（半径作用于本行运动）；每次 T 切换
+    （含与运动同行）都生成一次静止换刀事件，位置为切换时（本行运动前）
+    刀位点，执行顺序先于本行运动：先按新半径检查换刀点，再检查运动；
   * 刀与半径模态延续到下次切换；首个 T 之前的运动沿用初始刀（刀号为空）。
 - 除上述以外的任何运动/平面/坐标系指令（G18/G19/G54/G55/...、
   固定循环 G81 等、R 圆弧等）明确拒绝。
@@ -75,9 +76,11 @@ class Motion:
 
 @dataclass(frozen=True)
 class ToolChange:
-    """独立 T 行的静止换刀事件：当前刀位点不运动，但刀具半径切换。
+    """T 切换时的静止换刀事件：刀位不运动，但刀具半径切换。
 
-    多刀模式下，事件所在行也要按新半径对当前静止刀位做检查。
+    多刀模式下每次 T 切换（含与运动同行）都生成：事件位置为切换时
+    （本行运动前）刀位点，执行顺序先于本行运动，检查时先按新半径
+    检查该静止刀位，再检查本行运动。
     """
     line_no: int
     pos: tuple[float, float, float]
@@ -92,7 +95,7 @@ class ParseResult:
     line_count: int = 0
     nonblank_count: int = 0
     final_position: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    # 多刀模式下的静止换刀事件（独立 T 行），按程序顺序排列
+    # 多刀模式下的静止换刀事件（每次 T 切换，含与运动同行），按程序顺序排列
     tool_events: list[ToolChange] = field(default_factory=list)
 
 
@@ -161,7 +164,8 @@ def parse_gcode(text: str,
 
     tool_radius_map 为 None 时为单刀模式：T 字解析后忽略，与旧版一致。
     传入映射（可为空映射）时启用多刀模式：T 必须是非负整数、同行至多一个、
-    刀号必须在映射中；Tn 先于本行运动生效；独立 T 行产出静止换刀事件。
+    刀号必须在映射中；Tn 先于本行运动生效；每次 T 切换（含与运动同行）
+    都产出一次静止换刀事件（位置为本行运动前刀位，执行顺序先于本行运动）。
     initial_tool_radius 为初始刀位（首个 T 之前）的半径（mm）。
     """
     if not isinstance(text, str):
@@ -231,7 +235,6 @@ def parse_gcode(text: str,
 
         # 多刀模式：T 必须为非负整数、同行至多一个、刀号已映射；
         # 未启用映射时 T 与旧版一样完全忽略
-        tool_switched = False
         if t_codes and multi_tool:
             if len(t_codes) > 1:
                 raise GCodeError("同一行出现多个 T 刀号", idx)
@@ -244,7 +247,12 @@ def parse_gcode(text: str,
                 raise GCodeError(f"刀号 T{tno} 未在 tool_radii 映射中", idx)
             cur_tool_no = tno
             cur_tool_radius = float(tool_radius_map[tno])
-            tool_switched = True
+            # 每次 T 切换（含与运动同行）都记录一次静止换刀事件：
+            # 位置为本行运动前刀位，执行顺序先于本行运动，
+            # 检查时先按新半径检查该换刀点，再检查本行运动
+            event_seq += 1
+            result.tool_events.append(ToolChange(
+                idx, (x, y, z), cur_tool_no, cur_tool_radius, event_seq))
 
         # 先处理模态 G 字（平面/单位/绝对增量），再确定本行运动
         line_motion: int | None = None
@@ -273,12 +281,7 @@ def parse_gcode(text: str,
             effective_motion = G_RAPID
 
         if effective_motion is None:
-            # 纯模态/辅助行；多刀模式下独立 T 行仍产生静止换刀事件
-            if multi_tool and tool_switched:
-                event_seq += 1
-                result.tool_events.append(ToolChange(
-                    idx, (x, y, z), cur_tool_no, cur_tool_radius, event_seq))
-            continue  # 无几何运动
+            continue  # 纯模态/辅助行，无几何运动（T 切换事件已在上面记录）
 
         scale = INCH_TO_MM if unit_is_inch else 1.0
 
@@ -292,7 +295,6 @@ def parse_gcode(text: str,
         nx, ny, nz = resolve('X', x), resolve('Y', y), resolve('Z', z)
         start = (x, y, z)
         end = (nx, ny, nz)
-        emitted = False
 
         if effective_motion in (G_RAPID, G_LINE):
             # I/J 不允许搭配直线运动
@@ -307,7 +309,6 @@ def parse_gcode(text: str,
                     Motion("line", idx, start, end,
                            tool_no=cur_tool_no, tool_radius=cur_tool_radius,
                            seq=event_seq))
-                emitted = True
         else:
             if plane != G_PLANE_XY:
                 raise GCodeError("圆弧仅支持 G17 XY 平面", idx)
@@ -355,16 +356,8 @@ def parse_gcode(text: str,
                        theta0=theta0, sweep=sweep,
                        tool_no=cur_tool_no, tool_radius=cur_tool_radius,
                        seq=event_seq))
-            emitted = True
 
         x, y, z = nx, ny, nz
-
-        # T 与运动同行但该运动为零长度（未产生运动段）：按独立 T 行处理，
-        # 以新半径检查切换后的静止刀位
-        if multi_tool and tool_switched and not emitted:
-            event_seq += 1
-            result.tool_events.append(ToolChange(
-                idx, (x, y, z), cur_tool_no, cur_tool_radius, event_seq))
 
     result.final_position = (x, y, z)
     return result

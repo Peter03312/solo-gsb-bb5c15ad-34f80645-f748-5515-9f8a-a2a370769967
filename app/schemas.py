@@ -175,6 +175,25 @@ class MinClearanceOut(BaseModel):
         return data
 
 
+class TraceEventOut(BaseModel):
+    """执行事件轨迹中的一项（多刀模式，按执行顺序）。
+
+    kind：initial（初始刀位）/ tool_change（T 切换时的静止刀位，
+    含与运动同行、先于本行运动）/ motion（运动段）。
+    """
+    seq: int = Field(description="执行顺序（初始刀位为 0，从 1 起递增）")
+    kind: Literal["initial", "tool_change", "motion"]
+    line_no: int | None = Field(description="G-code 原行号；初始刀位为 null")
+    tool_no: int | None = Field(description="生效刀号；初始刀位为 null")
+    tool_radius_mm: float = Field(description="生效刀具半径（mm）")
+    start_mm: tuple[float, float, float] = Field(
+        description="事件起点刀尖坐标 [x, y, z]（mm）")
+    end_mm: tuple[float, float, float] = Field(
+        description="事件终点刀尖坐标 [x, y, z]（mm）；静止事件与起点相同")
+    hit_zone_no: int | None = Field(
+        description="该事件命中的禁区编号（段内取最早命中），未命中为 null")
+
+
 class ReviewResponse(BaseModel):
     report_id: int
     used_zone_versions: dict[str, int]
@@ -191,3 +210,6 @@ class ReviewResponse(BaseModel):
     # 旧请求/旧报告这两个字段为 null
     collision_tool_no: int | None = None
     collision_tool_radius_mm: float | None = None
+    # 多刀模式固化的执行事件轨迹（初始刀位 -> 各 T 切换静止刀位 -> 各段运动）；
+    # 单刀请求与旧报告为 null
+    execution_trace: list[TraceEventOut] | None = None

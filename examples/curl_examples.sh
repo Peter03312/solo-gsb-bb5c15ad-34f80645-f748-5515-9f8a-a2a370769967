@@ -132,3 +132,29 @@ for body in \
   curl -s -o /dev/null -w "HTTP %{http_code}\n" -X POST "$BASE/reviews" \
     -H 'Content-Type: application/json' -d "$body"
 done
+
+echo "== 14) 多刀执行事件轨迹（execution_trace）：同行 T 与运动分别记录 =="
+# 同行 T1 换 r=2 的刀：轨迹依次记录 初始刀位 -> 换刀点（静止，先按新半径检查）
+# -> 本行运动；换刀点 (0,11) 距方块边 1mm < 2 => tool_change 事件即首个命中，
+# 首碰撞行号 1、刀号 1；轨迹随报告固化，GET /reports/{id} 反复查询一致
+curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [0, 11, 0],
+        "tool_radius": 0.0,
+        "tool_radii": {"1": 2.0},
+        "gcode": "T1 G1 X5 Y11 Z0\n"
+      }'; echo
+
+echo "== 15) 回看上一次多刀报告的固化轨迹（不受禁区新版本影响） =="
+LAST_REPORT=$(curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5, 11, 0],
+        "tool_radius": 0.0,
+        "tool_radii": {"2": 2.0},
+        "gcode": "G1 X-2 Y11 Z0\nT2\nG1 X15 Y11 Z0\n"
+      }' | sed -n 's/.*"report_id":\([0-9]*\).*/\1/p')
+curl -s "$BASE/reports/$LAST_REPORT"; echo

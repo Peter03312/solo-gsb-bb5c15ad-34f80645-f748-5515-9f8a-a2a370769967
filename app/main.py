@@ -6,23 +6,26 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import func, inspect, select, text
 from sqlalchemy.orm import Session
 
-from .collision import (Zone, check_path, check_program, initial_collision,
-                        minimum_clearance, minimum_clearance_program)
+from .collision import (Zone, build_execution_trace, check_path,
+                        initial_collision, minimum_clearance,
+                        minimum_clearance_program)
 from .database import Base, engine, get_db
 from .gcode import GCodeError, parse_gcode
 from .geometry import GeometryError, normalize_polygon, validate_z_range
 from . import models
 from .models import Report, ZoneVersion
-from .schemas import (MinClearanceOut, ReviewRequest, ReviewResponse, ZoneCreate,
-                      ZoneDetailOut, ZoneOut, ZoneVersionCreate, ZoneVersionOut)
+from .schemas import (MinClearanceOut, ReviewRequest, ReviewResponse,
+                      TraceEventOut, ZoneCreate, ZoneDetailOut, ZoneOut,
+                      ZoneVersionCreate, ZoneVersionOut)
 
 app = FastAPI(
     title="数控刀路禁入区审查服务",
-    version="1.2.0",
+    version="1.3.0",
     description="登记毫米制二维多边形禁区（含闭合 Z 高度范围、不可变版本），"
                 "对 G-code 刀路做连续碰撞审查并出具不可变报告；"
                 "可选计算全程最小水平净间隙（include_min_clearance），"
-                "可选多刀半径映射（tool_radii：刀号到毫米半径）。",
+                "可选多刀半径映射（tool_radii：刀号到毫米半径），"
+                "多刀模式随报告固化可回看的执行事件轨迹（execution_trace）。",
 )
 
 
@@ -61,6 +64,10 @@ def _ensure_report_columns(db_engine) -> None:
         if "collision_tool_radius" not in existing:
             conn.execute(text(
                 "ALTER TABLE reports ADD COLUMN collision_tool_radius FLOAT"))
+        # v1.3：多刀模式执行事件轨迹固化列（单刀请求与旧报告为 NULL）
+        if "execution_trace" not in existing:
+            conn.execute(text(
+                "ALTER TABLE reports ADD COLUMN execution_trace JSON"))
 
 
 @app.exception_handler(GeometryError)
@@ -238,16 +245,31 @@ def review(payload: ReviewRequest,
         summary["tool_map_enabled"] = True
         summary["tool_radii_mm"] = {str(k): v for k, v in tool_map.items()}
 
+    trace_payload: list[dict] | None = None
     if multi_tool:
-        # 多刀模式：初始刀位 -> 静止换刀事件 -> 各段运动，按执行顺序统一裁决
-        collision = check_program(parsed.motions, parsed.tool_events, zones,
-                                  tuple(payload.start),  # type: ignore[arg-type]
-                                  float(payload.tool_radius))
+        # 多刀模式：构建执行事件轨迹（初始刀位 -> 各 T 切换静止刀位 ->
+        # 各段运动，同行 T 先于本行运动），首碰撞即轨迹中首个命中事件；
+        # 轨迹随报告固化，不因禁区新版本改变
+        trace = build_execution_trace(
+            parsed.motions, parsed.tool_events, zones,
+            tuple(payload.start),  # type: ignore[arg-type]
+            float(payload.tool_radius))
+        collision = next((ev.hit for ev in trace if ev.hit is not None), None)
         min_clr = minimum_clearance_program(
             parsed.motions, parsed.tool_events, zones,
             tuple(payload.start),  # type: ignore[arg-type]
             float(payload.tool_radius)) \
             if payload.include_min_clearance else None
+        trace_payload = [{
+            "seq": ev.seq,
+            "kind": ev.kind,
+            "line_no": ev.line_no,
+            "tool_no": ev.tool_no,
+            "tool_radius_mm": ev.tool_radius,
+            "start_mm": [ev.start[0], ev.start[1], ev.start[2]],
+            "end_mm": [ev.end[0], ev.end[1], ev.end[2]],
+            "hit_zone_no": ev.hit.zone_no if ev.hit is not None else None,
+        } for ev in trace]
     else:
         # 单刀模式：旧口径（初始刀位仅在无运动碰撞时补判）保持兼容
         collision = check_path(parsed.motions, zones, payload.tool_radius)
@@ -309,6 +331,7 @@ def review(payload: ReviewRequest,
         collision_tool_radius=collision_tool_radius,
         min_clearance_enabled=bool(payload.include_min_clearance),
         min_clearance=clearance_payload,
+        execution_trace=trace_payload,
     )
     db.add(report)
     db.commit()
@@ -323,7 +346,9 @@ def review(payload: ReviewRequest,
         if clearance_payload is not None else None,
         min_clearance_enabled=bool(payload.include_min_clearance),
         collision_tool_no=collision_tool_no,
-        collision_tool_radius_mm=collision_tool_radius)
+        collision_tool_radius_mm=collision_tool_radius,
+        execution_trace=[TraceEventOut(**e) for e in trace_payload]
+        if trace_payload is not None else None)
 
 
 @app.get("/reports/{report_id}", summary="查询不可变审查报告")
@@ -353,6 +378,8 @@ def get_report(report_id: int, db: Session = Depends(get_db)) -> dict:
         # 固化的可选最小净间隙：未启用的旧报告不含/为空，查询保持一致
         "min_clearance": report.min_clearance,
         "min_clearance_enabled": bool(report.min_clearance_enabled),
+        # 多刀模式固化的执行事件轨迹；单刀请求与旧报告为 null
+        "execution_trace": report.execution_trace,
     }
 
 

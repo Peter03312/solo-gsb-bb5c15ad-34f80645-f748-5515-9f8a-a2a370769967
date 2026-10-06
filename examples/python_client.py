@@ -140,7 +140,39 @@ def main() -> None:
     legacy_t.raise_for_status()
     j = legacy_t.json()
     assert j["collision_tool_no"] is None
+    assert j["execution_trace"] is None  # 单刀请求无轨迹
     print("legacy T ignored: collision_tool_no =", j["collision_tool_no"])
+
+    # 10. 多刀执行事件轨迹（execution_trace）：按执行顺序记录
+    #     初始刀位 -> 每次 T 切换的静止刀位（含同行，先于本行运动）-> 每段运动；
+    #     每项含原行号、刀号、半径、起止坐标与命中禁区编号（或空）。
+    #     同行 T1 换 r=2：换刀点 (0,11) 距方块边 1mm < 2 => 换刀事件即首个命中。
+    tr = c.post("/reviews", json={
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [0.0, 11.0, 0.0],
+        "tool_radius": 0.0,
+        "tool_radii": {"1": 2.0},
+        "gcode": "T1 G1 X5 Y11 Z0\n",
+    })
+    tr.raise_for_status()
+    body = tr.json()
+    trace = body["execution_trace"]
+    print("execution trace:")
+    for e in trace:
+        print(" ", e["seq"], e["kind"], "line", e["line_no"],
+              "tool", e["tool_no"], "r", e["tool_radius_mm"],
+              "hit", e["hit_zone_no"])
+    assert [e["kind"] for e in trace] == ["initial", "tool_change", "motion"]
+    assert trace[0]["hit_zone_no"] is None          # 初始刀 r=0，距离 1mm 不碰
+    assert trace[1]["hit_zone_no"] == 1             # 换刀点先按新半径检查：命中
+    assert trace[2]["hit_zone_no"] == 1             # 再检查本行运动：同样命中
+    # 首碰撞对应轨迹中首个命中事件
+    first_hit = next(e for e in trace if e["hit_zone_no"] is not None)
+    assert first_hit["line_no"] == body["collision_line_no"] == 1
+    assert first_hit["tool_no"] == body["collision_tool_no"] == 1
+    # 轨迹随报告固化：GET /reports/{id} 与提交响应一致，禁区新版本不影响
+    snap = c.get(f"/reports/{body['report_id']}").json()
+    assert snap["execution_trace"] == trace
 
 
 if __name__ == "__main__":

@@ -14,6 +14,12 @@
 净间隙 = 连续 XY 路径到填充多边形最小距离 − 刀具半径，
 同样只在刀尖 Z 处于禁区闭合高度范围的部分上统计；
 直线按分段二次函数精确求极值，圆弧按弧-边候选角解析求值。
+
+多刀模式执行事件轨迹（build_execution_trace）：
+按执行顺序记录初始刀位、每次 T 切换的静止刀位（含与运动同行，
+先于本行运动）与每段运动；每项给出原行号、刀号、半径、起止坐标
+与命中禁区编号（或空）。首碰撞即轨迹中首个命中事件；
+可选最小净间隙沿同一事件顺序裁决。
 """
 from __future__ import annotations
 
@@ -400,29 +406,15 @@ def check_program(motions: list[Motion],
     """多刀模式：按真实执行顺序检查初始刀位、静止换刀事件与各段运动。
 
     事件顺序：初始刀位（seq=0，刀号为空，半径为初始刀半径）→
-    解析出的运动/静止换刀事件（seq 从 1 起）。等值先按执行顺序，
+    解析出的运动/静止换刀事件（seq 从 1 起，同行 T 的换刀事件先于本行
+    运动）。首碰撞即执行事件轨迹中首个命中事件；等值先按执行顺序，
     再按段内进度、禁区编号裁决；每段运动使用该段生效刀具的半径。
     """
-    best = _static_collision(start, zones, initial_radius, None, 0, None)
-
-    events: list = list(tool_events) + list(motions)
-    events.sort(key=lambda e: e.seq)
-    for ev in events:
-        if isinstance(ev, ToolChange):
-            cand = _static_collision(ev.pos, zones, ev.tool_radius,
-                                     ev.line_no, ev.seq, ev.tool_no)
-            if cand is not None and (best is None or cand.order < best.order):
-                best = cand
-            continue
-        for zone in zones:  # 已按 zone_no 排序
-            prog = _motion_hit(ev, zone, ev.tool_radius)
-            if prog is None:
-                continue
-            c = Collision(ev.line_no, zone.zone_no, prog, ev.seq,
-                          tool_no=ev.tool_no, tool_radius=ev.tool_radius)
-            if best is None or _program_earlier(c, best):
-                best = c
-    return best
+    for ev in build_execution_trace(motions, tool_events, zones, start,
+                                    initial_radius):
+        if ev.hit is not None:
+            return ev.hit
+    return None
 
 
 def _program_earlier(a: Collision, b: Collision) -> bool:
@@ -432,6 +424,66 @@ def _program_earlier(a: Collision, b: Collision) -> bool:
     if abs(a.progress - b.progress) > EPS:
         return a.progress < b.progress
     return a.zone_no < b.zone_no
+
+
+# ---------- 多刀执行事件轨迹 ----------
+
+@dataclass
+class TraceEvent:
+    """执行事件轨迹中的一项（多刀模式）。
+
+    按执行顺序记录：初始刀位（kind="initial"，刀号为空）、每次 T 切换的
+    静止刀位（kind="tool_change"，含与运动同行，先于本行运动）、
+    每段运动（kind="motion"）。hit 为该事件内最早命中（无命中为 None）。
+    """
+    seq: int                 # 执行顺序（初始刀位为 0，其余与解析事件序号一致）
+    kind: str                # "initial" / "tool_change" / "motion"
+    line_no: int | None      # 原行号（初始刀位为 None）
+    tool_no: int | None      # 生效刀号（初始刀位为 None）
+    tool_radius: float       # 生效刀具半径（mm）
+    start: tuple[float, float, float]  # 起坐标（静止事件与 end 相同）
+    end: tuple[float, float, float]    # 止坐标
+    hit: Collision | None    # 该事件最早命中的碰撞（含禁区编号），未命中为 None
+
+
+def build_execution_trace(motions: list[Motion],
+                          tool_events: list[ToolChange],
+                          zones: list[Zone],
+                          start: tuple[float, float, float],
+                          initial_radius: float) -> list[TraceEvent]:
+    """构建多刀模式的执行事件轨迹（按执行顺序）。
+
+    顺序：初始刀位（seq=0，刀号为空，初始半径）→ 解析出的静止换刀事件与
+    运动段（seq 从 1 起，同行 T 的换刀事件先于本行运动）。
+    静止事件按生效半径检查静止刀位；运动事件按该段生效半径检查，
+    段内多禁区命中时按段内进度、禁区编号取最早。
+    """
+    trace: list[TraceEvent] = [TraceEvent(
+        0, "initial", None, None, float(initial_radius), start, start,
+        _static_collision(start, zones, initial_radius, None, 0, None))]
+
+    events: list = list(tool_events) + list(motions)
+    events.sort(key=lambda e: e.seq)
+    for ev in events:
+        if isinstance(ev, ToolChange):
+            hit = _static_collision(ev.pos, zones, ev.tool_radius,
+                                    ev.line_no, ev.seq, ev.tool_no)
+            trace.append(TraceEvent(ev.seq, "tool_change", ev.line_no,
+                                    ev.tool_no, ev.tool_radius,
+                                    ev.pos, ev.pos, hit))
+            continue
+        best: Collision | None = None
+        for zone in zones:  # 已按 zone_no 排序
+            prog = _motion_hit(ev, zone, ev.tool_radius)
+            if prog is None:
+                continue
+            c = Collision(ev.line_no, zone.zone_no, prog, ev.seq,
+                          tool_no=ev.tool_no, tool_radius=ev.tool_radius)
+            if best is None or _program_earlier(c, best):
+                best = c
+        trace.append(TraceEvent(ev.seq, "motion", ev.line_no, ev.tool_no,
+                                ev.tool_radius, ev.start, ev.end, best))
+    return trace
 
 
 # ---------- 全程最小水平净间隙 ----------
