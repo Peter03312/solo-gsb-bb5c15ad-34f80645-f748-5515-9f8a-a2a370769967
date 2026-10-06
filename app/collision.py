@@ -14,6 +14,13 @@
 净间隙 = 连续 XY 路径到填充多边形最小距离 − 刀具半径，
 同样只在刀尖 Z 处于禁区闭合高度范围的部分上统计；
 直线按分段二次函数精确求极值，圆弧按弧-边候选角解析求值。
+
+多刀模式执行事件轨迹（build_program_trajectory）：
+按真实执行顺序给出「初始刀位 → 每次 T 切换的静止换刀点 → 各段运动」；
+T 与运动同行时静止换刀事件先于本行运动（先按新半径检查换刀点，再检查运动）。
+每个事件记录原行号、刀号、半径、起止坐标与命中禁区编号（无命中为 None）；
+首碰撞即轨迹上首个命中事件。轨迹数据在请求时固化进报告，
+后续禁区新版本不影响已固化轨迹。
 """
 from __future__ import annotations
 
@@ -371,25 +378,101 @@ def initial_collision(pos: tuple[float, float, float],
     return None
 
 
-def _static_collision(pos: tuple[float, float, float],
-                      zones: list[Zone], tool_r: float,
-                      line_no: int | None, seq: int,
-                      tool_no: int | None) -> Collision | None:
-    """静止刀位（初始刀位或独立 T 行切换后）的最早碰撞。
-
-    静止点无“段内进度”（按 0 计）；同一点多个禁区命中时取最小编号。
-    """
+def _static_hit_zone(pos: tuple[float, float, float],
+                     zones: list[Zone], tool_r: float) -> int | None:
+    """静止刀位（初始刀位/换刀点）的命中禁区编号；同点多禁区取最小编号。"""
     x, y, z = pos
-    best: Collision | None = None
+    hit: int | None = None
     for zone in zones:  # 已按 zone_no 排序
         if zone.z_min - EPS <= z <= zone.z_max + EPS and \
                 point_polygon_distance((x, y), zone.polygon) <= \
                 tool_r + CONTACT_EPS:
-            cand = Collision(line_no, zone.zone_no, 0.0, seq,
-                             tool_no=tool_no, tool_radius=tool_r)
-            if best is None or cand.zone_no < best.zone_no:
-                best = cand
-    return best
+            if hit is None or zone.zone_no < hit:
+                hit = zone.zone_no
+    return hit
+
+
+def _motion_hit_zone(m: Motion, zones: list[Zone],
+                     tool_r: float) -> tuple[int, float] | None:
+    """一段运动的命中禁区编号与最早进度；多禁区取最早，等进度取小编号。"""
+    hit: int | None = None
+    hit_prog = 0.0
+    for zone in zones:  # zones 已按 zone_no 排序
+        prog = _motion_hit(m, zone, tool_r)
+        if prog is None:
+            continue
+        if hit is None or prog < hit_prog - EPS or \
+                (abs(prog - hit_prog) <= EPS and zone.zone_no < hit):
+            hit, hit_prog = zone.zone_no, prog
+    if hit is None:
+        return None
+    return hit, hit_prog
+
+
+@dataclass(frozen=True)
+class TrajectoryEvent:
+    """多刀模式执行事件轨迹中的单个事件（初始刀位/静止换刀点/运动段）。"""
+    seq: int                              # 执行顺序（0 起，初始刀位为 0）
+    kind: str                             # "initial" / "tool_change" / "motion"
+    line_no: int | None                   # G-code 原行号（初始刀位为 None）
+    tool_no: int | None                   # 生效刀号（初始刀位为 None）
+    tool_radius: float                    # 生效半径（mm）
+    start: tuple[float, float, float]     # 起始刀位点（mm）
+    end: tuple[float, float, float]       # 终止刀位点（静止事件起止相同）
+    motion_kind: str | None               # 运动几何："line"/"arc"；静止为 None
+    hit_zone_no: int | None               # 命中禁区编号；无命中为 None
+    hit_progress: float = 0.0             # 内部：命中段内进度（静止为 0）
+
+    def to_record(self) -> dict:
+        """JSON 友好的固化记录（随报告保存，不随后续禁区版本变化）。"""
+        return {
+            "seq": self.seq,
+            "event_type": self.kind,
+            "line_no": self.line_no,
+            "tool_no": self.tool_no,
+            "tool_radius_mm": self.tool_radius,
+            "start_mm": [float(c) for c in self.start],
+            "end_mm": [float(c) for c in self.end],
+            "motion_kind": self.motion_kind,
+            "hit_zone_no": self.hit_zone_no,
+        }
+
+
+def build_program_trajectory(motions: list[Motion],
+                             tool_events: list[ToolChange],
+                             zones: list[Zone],
+                             start: tuple[float, float, float],
+                             initial_radius: float) -> list[TrajectoryEvent]:
+    """多刀模式执行事件轨迹。
+
+    事件顺序：初始刀位（seq=0，刀号为空、初始半径）→ 按 seq 合并的
+    静止换刀事件与运动段。T 与运动同行时解析器已令静止事件先于本行运动，
+    故轨迹上先按新半径检查换刀点、再检查运动。每事件只记录一个命中禁区
+    编号（静止点取最小编号；运动段取最早命中、等进度取小编号），无命中为 None。
+    """
+    events: list[TrajectoryEvent] = [
+        TrajectoryEvent(
+            0, "initial", None, None, float(initial_radius),
+            tuple(start), tuple(start), None,
+            _static_hit_zone(start, zones, initial_radius))
+    ]
+
+    ordered: list = list(tool_events) + list(motions)
+    ordered.sort(key=lambda e: e.seq)
+    for ev in ordered:
+        if isinstance(ev, ToolChange):
+            events.append(TrajectoryEvent(
+                ev.seq, "tool_change", ev.line_no, ev.tool_no,
+                float(ev.tool_radius), tuple(ev.pos), tuple(ev.pos), None,
+                _static_hit_zone(ev.pos, zones, ev.tool_radius)))
+            continue
+        hit = _motion_hit_zone(ev, zones, ev.tool_radius)
+        events.append(TrajectoryEvent(
+            ev.seq, "motion", ev.line_no, ev.tool_no, float(ev.tool_radius),
+            tuple(ev.start), tuple(ev.end), ev.kind,
+            hit[0] if hit is not None else None,
+            hit[1] if hit is not None else 0.0))
+    return events
 
 
 def check_program(motions: list[Motion],
@@ -400,38 +483,22 @@ def check_program(motions: list[Motion],
     """多刀模式：按真实执行顺序检查初始刀位、静止换刀事件与各段运动。
 
     事件顺序：初始刀位（seq=0，刀号为空，半径为初始刀半径）→
-    解析出的运动/静止换刀事件（seq 从 1 起）。等值先按执行顺序，
-    再按段内进度、禁区编号裁决；每段运动使用该段生效刀具的半径。
+    解析出的静止换刀/运动事件（按 seq）。首碰撞即执行轨迹上的首个命中事件；
+    同一运动段多个禁区命中时取最早进度，等进度取禁区编号最小区分度。
+    每段运动使用该段生效刀具的半径。
     """
-    best = _static_collision(start, zones, initial_radius, None, 0, None)
-
-    events: list = list(tool_events) + list(motions)
-    events.sort(key=lambda e: e.seq)
-    for ev in events:
-        if isinstance(ev, ToolChange):
-            cand = _static_collision(ev.pos, zones, ev.tool_radius,
-                                     ev.line_no, ev.seq, ev.tool_no)
-            if cand is not None and (best is None or cand.order < best.order):
-                best = cand
+    trajectory = build_program_trajectory(motions, tool_events, zones,
+                                          start, initial_radius)
+    best: Collision | None = None
+    for ev in trajectory:
+        if ev.hit_zone_no is None:
             continue
-        for zone in zones:  # 已按 zone_no 排序
-            prog = _motion_hit(ev, zone, ev.tool_radius)
-            if prog is None:
-                continue
-            c = Collision(ev.line_no, zone.zone_no, prog, ev.seq,
-                          tool_no=ev.tool_no, tool_radius=ev.tool_radius)
-            if best is None or _program_earlier(c, best):
-                best = c
+        # 首碰撞 = 轨迹上首个命中事件（顺序即 seq）；同段多禁区已取最早进度
+        cand = Collision(ev.line_no, ev.hit_zone_no, ev.hit_progress, ev.seq,
+                         tool_no=ev.tool_no, tool_radius=ev.tool_radius)
+        if best is None or cand.order < best.order:
+            best = cand
     return best
-
-
-def _program_earlier(a: Collision, b: Collision) -> bool:
-    """等值裁决：执行顺序（seq）→ 段内进度 → 禁区编号。"""
-    if a.order != b.order:
-        return a.order < b.order
-    if abs(a.progress - b.progress) > EPS:
-        return a.progress < b.progress
-    return a.zone_no < b.zone_no
 
 
 # ---------- 全程最小水平净间隙 ----------

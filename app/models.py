@@ -79,3 +79,10 @@ class Report(Base):
     # {min_clearance_mm, line_no, point_mm, zone_no, progress,
     #  tool_no, tool_radius_mm} 或 None
     min_clearance = Column(JSON, nullable=True)
+
+    # v1.3：多刀模式执行事件轨迹（仅 tool_radii 请求固化）。
+    # 每项 {seq, event_type, line_no, tool_no, tool_radius_mm,
+    #       start_mm, end_mm, motion_kind, hit_zone_no}，按执行顺序；
+    # 单刀请求/旧报告为 NULL，读取保持兼容。轨迹随报告固化，
+    # 不随后续禁区新版本变化。
+    event_trajectory = Column(JSON, nullable=True)

@@ -15,7 +15,8 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app import gcode as gc  # noqa: E402
 from app import models  # noqa: E402
-from app.collision import (Zone, check_path, check_program, initial_collision,
+from app.collision import (Zone, build_program_trajectory, check_path,
+                           check_program, initial_collision,
                            minimum_clearance, minimum_clearance_program)  # noqa: E402
 from app.geometry import GeometryError, normalize_polygon  # noqa: E402
 from app.main import app  # noqa: E402
@@ -591,7 +592,14 @@ class MultiToolParserTests(unittest.TestCase):
         m = r.motions[0]
         self.assertEqual(m.tool_no, 2)
         self.assertEqual(m.tool_radius, 3.0)
-        self.assertEqual(r.tool_events, [])  # 同行有运动，不产生静止事件
+        # 同行 T 与运动分别记录：先静止换刀事件（切换前位置，新半径），再运动
+        self.assertEqual(len(r.tool_events), 1)
+        ev = r.tool_events[0]
+        self.assertEqual(ev.line_no, 1)
+        self.assertEqual(ev.tool_no, 2)
+        self.assertEqual(ev.tool_radius, 3.0)
+        self.assertEqual(ev.pos, self.START)
+        self.assertEqual([ev.seq, m.seq], [1, 2])
         # T 之前的运动沿用初始刀（刀号为空）
         r2 = self.parse("G1 X0 Y11\nT2\nG1 X15 Y11\n", tmap={2: 3.0}, r0=0.5)
         self.assertIsNone(r2.motions[0].tool_no)
@@ -737,6 +745,108 @@ class MultiToolClearanceEngineTests(unittest.TestCase):
         self.assertIsNone(cp.tool_no)
         self.assertEqual(cp.tool_radius, 0.5)
 
+    def test_clearance_same_line_t_static_adjudicated_in_order(self):
+        # 同行 T：先按新半径 r=2 检查静止换刀点 (0,11)（净间隙 -1），
+        # 再检查本行运动；全局最小由顺序在前的静止换刀事件裁决
+        p = gc.parse_gcode("T1 G1 X15 Y11\n", (0.0, 11.0, 0.0),
+                           tool_radius_map={1: 2.0}, initial_tool_radius=0.0)
+        cp = minimum_clearance_program(p.motions, p.tool_events,
+                                       [self.zone], (0.0, 11.0, 0.0), 0.0)
+        self.assertEqual(cp.net, -1.0)
+        self.assertEqual(cp.line_no, 1)
+        self.assertEqual(cp.tool_no, 1)
+        self.assertEqual(cp.tool_radius, 2.0)
+        self.assertEqual(cp.point, (0.0, 11.0, 0.0))
+
+
+class TrajectoryEngineTests(unittest.TestCase):
+    def setUp(self):
+        # 10x10 方块禁区，z ∈ [-5, 5]
+        self.zone = Zone(1, normalize_polygon(SQUARE), -5.0, 5.0)
+
+    def traj(self, text, start=(-5.0, 11.0, 0.0), r0=0.0, tmap=None,
+             zones=None):
+        p = gc.parse_gcode(text, start, tool_radius_map=tmap,
+                           initial_tool_radius=r0)
+        return build_program_trajectory(p.motions, p.tool_events,
+                                        zones or [self.zone], start, r0)
+
+    def _records(self, events):
+        return [e.to_record() for e in events]
+
+    def test_initial_tool_change_motion_order_and_fields(self):
+        evs = self.traj("G1 X-2 Y11\nT2\nG1 X15 Y11\n", tmap={2: 2.0})
+        recs = self._records(evs)
+        kinds = [(e["seq"], e["event_type"], e["line_no"], e["tool_no"])
+                 for e in recs]
+        self.assertEqual(kinds, [
+            (0, "initial", None, None),
+            (1, "motion", 1, None),
+            (2, "tool_change", 2, 2),
+            (3, "motion", 3, 2),
+        ])
+        initial = recs[0]
+        self.assertEqual(initial["tool_radius_mm"], 0.0)
+        self.assertEqual(initial["start_mm"], [-5.0, 11.0, 0.0])
+        self.assertEqual(initial["end_mm"], [-5.0, 11.0, 0.0])
+        self.assertIsNone(initial["motion_kind"])
+        switch = recs[2]
+        self.assertEqual(switch["tool_radius_mm"], 2.0)
+        # 静止换刀事件起止相同，位置为切换瞬间刀位点
+        self.assertEqual(switch["start_mm"], [-2.0, 11.0, 0.0])
+        self.assertEqual(switch["end_mm"], [-2.0, 11.0, 0.0])
+        self.assertIsNone(switch["motion_kind"])
+        motion = recs[3]
+        self.assertEqual(motion["motion_kind"], "line")
+        self.assertEqual(motion["start_mm"], [-2.0, 11.0, 0.0])
+        self.assertEqual(motion["end_mm"], [15.0, 11.0, 0.0])
+        # 仅最后一段运动（r=2 横穿 y=11，最近 1mm）命中
+        self.assertEqual([e["hit_zone_no"] for e in recs],
+                         [None, None, None, 1])
+
+    def test_same_line_t_splits_static_before_motion(self):
+        # 同行 T 与运动须分别记录：换刀点（新半径）seq 在前，运动在后；
+        # 静止点 (0,11) 距上边 1mm，r=2 => 换刀点先命中
+        evs = self.traj("T1 G1 X15 Y11\n", start=(0.0, 11.0, 0.0),
+                        tmap={1: 2.0})
+        recs = self._records(evs)
+        self.assertEqual([e["event_type"] for e in recs],
+                         ["initial", "tool_change", "motion"])
+        self.assertEqual([e["line_no"] for e in recs], [None, 1, 1])
+        self.assertEqual(recs[1]["start_mm"], [0.0, 11.0, 0.0])
+        self.assertEqual(recs[1]["end_mm"], [0.0, 11.0, 0.0])
+        self.assertEqual(recs[1]["tool_no"], 1)
+        self.assertEqual(recs[1]["hit_zone_no"], 1)  # 先按新半径检查换刀点
+        self.assertEqual(recs[2]["hit_zone_no"], 1)  # 再检查本行运动
+        # 首碰撞与轨迹首个命中事件一致：行 1、刀 1、半径 2
+        first = next(e for e in recs if e["hit_zone_no"] is not None)
+        self.assertEqual((first["line_no"], first["tool_no"],
+                          first["tool_radius_mm"]), (1, 1, 2.0))
+
+    def test_initial_position_hit_is_first_event(self):
+        evs = self.traj("T1\nG1 X5 Y5\n", start=(5.0, 5.0, 0.0), r0=0.5,
+                        tmap={1: 9.0})
+        recs = self._records(evs)
+        self.assertEqual(recs[0]["event_type"], "initial")
+        self.assertEqual(recs[0]["hit_zone_no"], 1)
+        self.assertIsNone(recs[0]["line_no"])
+        self.assertIsNone(recs[0]["tool_no"])
+        self.assertEqual(recs[0]["tool_radius_mm"], 0.5)
+        # 首个命中事件就是初始刀位
+        first = next(e for e in recs if e["hit_zone_no"] is not None)
+        self.assertIsNone(first["line_no"])
+
+    def test_hit_zone_null_when_clear(self):
+        evs = self.traj("G1 X-5 Y50\nT1\nG1 X15 Y50\n",
+                        r0=2.0, tmap={1: 0.5})
+        self.assertTrue(all(e.hit_zone_no is None for e in evs))
+
+    def test_arc_motion_kind_recorded(self):
+        text = "G1 X10 Y0 Z0\nG3 X10 Y0 I-10 J0\n"
+        evs = self.traj(text, start=(-50.0, -50.0, 0.0), tmap={1: 0.0})
+        recs = self._records(evs)
+        self.assertEqual(recs[-1]["motion_kind"], "arc")
+
 
 class MultiToolApiTests(unittest.TestCase):
     ZONE_NO = 600
@@ -851,6 +961,75 @@ class MultiToolApiTests(unittest.TestCase):
         self.assertIsNone(got["collision_tool_no"])
         self.assertIsNone(got["collision_tool_radius_mm"])
 
+    def test_event_trajectory_frozen_and_replayable(self):
+        gcode = "G1 X-2 Y11 Z0\nT2\nG1 X15 Y11 Z0\n"
+        r = self._review(gcode=gcode, tool_radii={"2": 2.0},
+                         include_min_clearance=True)
+        self.assertEqual(r.status_code, 200, r.text)
+        b = r.json()
+        traj = b["event_trajectory"]
+        # 初始刀位 -> 初始刀运动 -> 静止换刀 -> 换刀后运动，共 4 个事件
+        self.assertEqual([e["seq"] for e in traj], [0, 1, 2, 3])
+        self.assertEqual([e["event_type"] for e in traj],
+                         ["initial", "motion", "tool_change", "motion"])
+        # 每项含原行号、刀号、半径、起止坐标、命中禁区编号或 null
+        for e in traj:
+            for key in ("seq", "event_type", "line_no", "tool_no",
+                        "tool_radius_mm", "start_mm", "end_mm",
+                        "motion_kind", "hit_zone_no"):
+                self.assertIn(key, e)
+            self.assertEqual(len(e["start_mm"]), 3)
+            self.assertEqual(len(e["end_mm"]), 3)
+        self.assertIsNone(traj[0]["line_no"])
+        self.assertIsNone(traj[0]["tool_no"])
+        self.assertEqual(traj[2]["line_no"], 2)
+        self.assertEqual(traj[2]["tool_no"], 2)
+        self.assertEqual(traj[2]["tool_radius_mm"], 2.0)
+        self.assertEqual(traj[2]["start_mm"], traj[2]["end_mm"])
+        # 首碰撞行 3 对应轨迹上首个非空 hit_zone_no
+        hits = [e for e in traj if e["hit_zone_no"] is not None]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["line_no"], 3)
+        self.assertEqual(hits[0]["hit_zone_no"], self.ZONE_NO)
+        # 固化：GET 一致
+        got = client.get(f"/reports/{b['report_id']}").json()
+        self.assertEqual(got["event_trajectory"], traj)
+        # 禁区出新版本（平移到远处）：旧报告轨迹不变
+        client.post(f"/zones/{self.ZONE_NO}/versions", json={
+            "polygon": [[100, 100], [110, 100], [110, 110], [100, 110]],
+            "z_min": -5, "z_max": 5})
+        got2 = client.get(f"/reports/{b['report_id']}").json()
+        self.assertEqual(got2["event_trajectory"], traj)
+
+    def test_same_line_t_trajectory_static_then_motion(self):
+        # 同行 T+运动分别记录；换刀点 (0,11) r=2 先命中（先于运动）
+        r = self._review(start=[0.0, 11.0, 0.0],
+                         gcode="T3 G1 X5 Y11 Z0\n",
+                         tool_radii={"3": 2.0})
+        b = r.json()
+        traj = b["event_trajectory"]
+        self.assertEqual([e["event_type"] for e in traj],
+                         ["initial", "tool_change", "motion"])
+        self.assertEqual([e["seq"] for e in traj], [0, 1, 2])
+        self.assertEqual(traj[1]["line_no"], 1)
+        self.assertEqual(traj[1]["hit_zone_no"], self.ZONE_NO)
+        # 首碰撞对应首个命中事件：静止换刀点（行 1、刀 3）
+        self.assertEqual(b["collision_line_no"], 1)
+        self.assertEqual(b["collision_tool_no"], 3)
+        self.assertEqual(b["collision_zone_no"], self.ZONE_NO)
+
+    def test_trajectory_null_for_single_tool_and_invalid_t_no_report(self):
+        r = self._review(gcode="T7 M6\nG1 X15 Y11 Z0\n", tool_radius=0.5)
+        self.assertIsNone(r.json()["event_trajectory"])
+        got = client.get(f"/reports/{r.json()['report_id']}").json()
+        self.assertIsNone(got["event_trajectory"])
+        # 非法 T：422 拒绝，不留报告（自然也无轨迹）
+        ok = self._review(tool_radii={"1": 1.0})
+        last_id = ok.json()["report_id"]
+        bad = self._review(gcode="T9\n", tool_radii={"1": 1.0})
+        self.assertEqual(bad.status_code, 422)
+        self.assertEqual(client.get(f"/reports/{last_id + 1}").status_code, 404)
+
 
 class SchemaMigrationTests(unittest.TestCase):
     """旧库（缺少 v1.1/v1.2 新列）启动时幂等补齐，旧报告读取兼容。"""
@@ -880,7 +1059,8 @@ class SchemaMigrationTests(unittest.TestCase):
         mainmod._ensure_report_columns(legacy)
         cols = {c["name"] for c in inspect(legacy).get_columns("reports")}
         for name in ("min_clearance_enabled", "min_clearance",
-                     "collision_tool_no", "collision_tool_radius"):
+                     "collision_tool_no", "collision_tool_radius",
+                     "event_trajectory"):
             self.assertIn(name, cols)
         # 再跑一次幂等
         mainmod._ensure_report_columns(legacy)
@@ -893,6 +1073,7 @@ class SchemaMigrationTests(unittest.TestCase):
             self.assertIsNone(report.collision_tool_radius)
             self.assertFalse(bool(report.min_clearance_enabled))
             self.assertIsNone(report.min_clearance)
+            self.assertIsNone(report.event_trajectory)
         finally:
             db.close()
             legacy.dispose()

@@ -132,3 +132,31 @@ for body in \
   curl -s -o /dev/null -w "HTTP %{http_code}\n" -X POST "$BASE/reviews" \
     -H 'Content-Type: application/json' -d "$body"
 done
+
+echo "== 14) 执行事件轨迹：同行 T 与运动分别记录（先检查换刀点，再检查运动） =="
+# 起点 (0,11) 距 10x10 方块禁区上边 1mm；初始刀 r=0 安全，
+# T1 换 r=2：静止换刀点 (0,11) 先命中（hit_zone_no=1，seq=1），
+# 随后本行 y=11 横穿运动（seq=2）同样命中；首碰撞即首个命中事件（行 1、刀 1）。
+curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [0, 11, 0],
+        "tool_radius": 0.0,
+        "tool_radii": {"1": 2.0},
+        "gcode": "T1 G1 X15 Y11 Z0\n"
+      }' | python3 -m json.tool
+
+echo "== 15) 回看固化报告中的事件轨迹（不随后续禁区新版本变化） =="
+RID="$(curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5, 11, 0],
+        "tool_radius": 0.0,
+        "tool_radii": {"2": 2.0},
+        "gcode": "G1 X-2 Y11 Z0\nT2\nG1 X15 Y11 Z0\n"
+      }' | python3 -c 'import sys,json; print(json.load(sys.stdin)["report_id"])')"
+echo "report_id=$RID"
+curl -s "$BASE/reports/$RID" \
+  | python3 -c 'import sys,json; d=json.load(sys.stdin); [print(e["seq"], e["event_type"], "line", e["line_no"], "tool", e["tool_no"], "r", e["tool_radius_mm"], e["start_mm"], "->", e["end_mm"], "zone", e["hit_zone_no"]) for e in d["event_trajectory"]]'

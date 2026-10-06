@@ -14,8 +14,10 @@
 - T 刀号默认解析后忽略（单刀模式，与旧版一致）；当调用方传入
   tool_radius_map（刀号 -> 毫米半径）时启用多刀模式：
   * Tn 必须为非负整数，同一行至多一个 T，且 n 必须在映射中，否则拒绝；
-  * Tn 在其所在行先于运动生效（半径作用于本行运动）；无运动的独立 T 行
-    生成一次静止换刀事件，位置为当前刀位点；
+  * Tn 在其所在行先于运动生效（半径作用于本行运动）；**任何 T 切换都生成
+    一次静止换刀事件**，位置为切换瞬间（本行运动开始前）的刀位点：无运动的
+    独立 T 行检查当前静止刀位，T 与运动同行时静止事件先于本行运动事件，
+    即先按新半径检查换刀点、再按新半径检查本行运动；
   * 刀与半径模态延续到下次切换；首个 T 之前的运动沿用初始刀（刀号为空）。
 - 除上述以外的任何运动/平面/坐标系指令（G18/G19/G54/G55/...、
   固定循环 G81 等、R 圆弧等）明确拒绝。
@@ -75,9 +77,11 @@ class Motion:
 
 @dataclass(frozen=True)
 class ToolChange:
-    """独立 T 行的静止换刀事件：当前刀位点不运动，但刀具半径切换。
+    """T 切换的静止换刀事件：切换瞬间刀位点不运动，但刀具半径切换。
 
-    多刀模式下，事件所在行也要按新半径对当前静止刀位做检查。
+    多刀模式下，每次 T 切换（含 T 与运动同行）都生成一次静止事件，
+    位置为切换瞬间（同行运动开始前）的刀位点，按新半径检查；
+    事件先于同行运动，即先检查换刀点再检查本行运动。
     """
     line_no: int
     pos: tuple[float, float, float]
@@ -161,7 +165,8 @@ def parse_gcode(text: str,
 
     tool_radius_map 为 None 时为单刀模式：T 字解析后忽略，与旧版一致。
     传入映射（可为空映射）时启用多刀模式：T 必须是非负整数、同行至多一个、
-    刀号必须在映射中；Tn 先于本行运动生效；独立 T 行产出静止换刀事件。
+    刀号必须在映射中；每次 T 切换都产出一次静止换刀事件（位置为切换瞬间
+    刀位点，先于同行运动），随后本行/后续运动按新半径检查。
     initial_tool_radius 为初始刀位（首个 T 之前）的半径（mm）。
     """
     if not isinstance(text, str):
@@ -294,6 +299,15 @@ def parse_gcode(text: str,
         end = (nx, ny, nz)
         emitted = False
 
+        def emit_static_switch() -> None:
+            """同行 T 与运动：先记录切换瞬间（运动开始前）静止刀位的换刀事件，
+            使执行顺序上先按新半径检查换刀点，再检查本行运动。"""
+            if multi_tool and tool_switched:
+                nonlocal event_seq
+                event_seq += 1
+                result.tool_events.append(ToolChange(
+                    idx, start, cur_tool_no, cur_tool_radius, event_seq))
+
         if effective_motion in (G_RAPID, G_LINE):
             # I/J 不允许搭配直线运动
             if 'I' in axes or 'J' in axes:
@@ -302,6 +316,7 @@ def parse_gcode(text: str,
                 raise GCodeError("运动坐标必须为有限数值", idx)
             if (abs(nx - x) > EPS or abs(ny - y) > EPS
                     or abs(nz - z) > EPS):
+                emit_static_switch()
                 event_seq += 1
                 result.motions.append(
                     Motion("line", idx, start, end,
@@ -348,6 +363,7 @@ def parse_gcode(text: str,
             if abs(sweep) < EPS:
                 raise GCodeError("圆弧扫掠角为零，非法圆弧", idx)
 
+            emit_static_switch()
             event_seq += 1
             result.motions.append(
                 Motion("arc", idx, start, end,

@@ -6,23 +6,27 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import func, inspect, select, text
 from sqlalchemy.orm import Session
 
-from .collision import (Zone, check_path, check_program, initial_collision,
+from .collision import (Zone, build_program_trajectory, check_path,
+                        check_program, initial_collision,
                         minimum_clearance, minimum_clearance_program)
 from .database import Base, engine, get_db
 from .gcode import GCodeError, parse_gcode
 from .geometry import GeometryError, normalize_polygon, validate_z_range
 from . import models
 from .models import Report, ZoneVersion
-from .schemas import (MinClearanceOut, ReviewRequest, ReviewResponse, ZoneCreate,
-                      ZoneDetailOut, ZoneOut, ZoneVersionCreate, ZoneVersionOut)
+from .schemas import (MinClearanceOut, ReviewRequest, ReviewResponse,
+                      TrajectoryEventOut, ZoneCreate,
+                      ZoneDetailOut, ZoneOut, ZoneVersionCreate,
+                      ZoneVersionOut)
 
 app = FastAPI(
     title="数控刀路禁入区审查服务",
-    version="1.2.0",
+    version="1.3.0",
     description="登记毫米制二维多边形禁区（含闭合 Z 高度范围、不可变版本），"
                 "对 G-code 刀路做连续碰撞审查并出具不可变报告；"
                 "可选计算全程最小水平净间隙（include_min_clearance），"
-                "可选多刀半径映射（tool_radii：刀号到毫米半径）。",
+                "可选多刀半径映射（tool_radii：刀号到毫米半径），"
+                "多刀报告固化可回看的执行事件轨迹（初始刀位/换刀点/各段运动）。",
 )
 
 
@@ -61,6 +65,10 @@ def _ensure_report_columns(db_engine) -> None:
         if "collision_tool_radius" not in existing:
             conn.execute(text(
                 "ALTER TABLE reports ADD COLUMN collision_tool_radius FLOAT"))
+        # v1.3：多刀模式执行事件轨迹列（旧报告/单刀请求为 NULL）
+        if "event_trajectory" not in existing:
+            conn.execute(text(
+                "ALTER TABLE reports ADD COLUMN event_trajectory JSON"))
 
 
 @app.exception_handler(GeometryError)
@@ -239,7 +247,14 @@ def review(payload: ReviewRequest,
         summary["tool_radii_mm"] = {str(k): v for k, v in tool_map.items()}
 
     if multi_tool:
-        # 多刀模式：初始刀位 -> 静止换刀事件 -> 各段运动，按执行顺序统一裁决
+        # 多刀模式：初始刀位 -> 静止换刀事件 -> 各段运动，按执行顺序统一裁决。
+        # 轨迹在报告创建时一次性构建并固化：首碰撞即轨迹上首个命中事件，
+        # 最小净间隙沿同一执行顺序裁决；后续禁区新版本不改变已固化轨迹。
+        trajectory = build_program_trajectory(
+            parsed.motions, parsed.tool_events, zones,
+            tuple(payload.start),  # type: ignore[arg-type]
+            float(payload.tool_radius))
+        trajectory_records = [ev.to_record() for ev in trajectory]
         collision = check_program(parsed.motions, parsed.tool_events, zones,
                                   tuple(payload.start),  # type: ignore[arg-type]
                                   float(payload.tool_radius))
@@ -254,6 +269,7 @@ def review(payload: ReviewRequest,
         min_clr = minimum_clearance(parsed.motions, zones, payload.tool_radius,
                                     tuple(payload.start)) \
             if payload.include_min_clearance else None
+        trajectory_records = None
 
     line_no: int | None = None
     zone_no: int | None = None
@@ -309,6 +325,7 @@ def review(payload: ReviewRequest,
         collision_tool_radius=collision_tool_radius,
         min_clearance_enabled=bool(payload.include_min_clearance),
         min_clearance=clearance_payload,
+        event_trajectory=trajectory_records,
     )
     db.add(report)
     db.commit()
@@ -323,7 +340,10 @@ def review(payload: ReviewRequest,
         if clearance_payload is not None else None,
         min_clearance_enabled=bool(payload.include_min_clearance),
         collision_tool_no=collision_tool_no,
-        collision_tool_radius_mm=collision_tool_radius)
+        collision_tool_radius_mm=collision_tool_radius,
+        event_trajectory=[TrajectoryEventOut(**rec)
+                          for rec in trajectory_records]
+        if trajectory_records is not None else None)
 
 
 @app.get("/reports/{report_id}", summary="查询不可变审查报告")
@@ -353,6 +373,9 @@ def get_report(report_id: int, db: Session = Depends(get_db)) -> dict:
         # 固化的可选最小净间隙：未启用的旧报告不含/为空，查询保持一致
         "min_clearance": report.min_clearance,
         "min_clearance_enabled": bool(report.min_clearance_enabled),
+        # 固化的多刀执行事件轨迹：单刀旧请求/旧报告为 null；
+        # 轨迹在报告创建时定格，不随后续禁区新版本变化
+        "event_trajectory": report.event_trajectory,
     }
 
 

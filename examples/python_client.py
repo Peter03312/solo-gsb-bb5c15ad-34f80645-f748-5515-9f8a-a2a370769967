@@ -141,6 +141,42 @@ def main() -> None:
     j = legacy_t.json()
     assert j["collision_tool_no"] is None
     print("legacy T ignored: collision_tool_no =", j["collision_tool_no"])
+    # 单刀请求不出轨迹（与旧报告兼容）
+    assert j["event_trajectory"] is None
+
+    # 10. 多刀执行事件轨迹（event_trajectory）：可回看的执行事件序列
+    #     同行 T 与运动分别记录：先按新半径检查静止换刀点，再检查本行运动。
+    tr = c.post("/reviews", json={
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [0.0, 11.0, 0.0],     # 换刀点距禁区上边 1mm
+        "tool_radius": 0.0,            # 初始刀 r=0：初始刀位安全
+        "tool_radii": {"1": 2.0},      # T1 换 r=2 的刀
+        "gcode": "T1 G1 X15 Y11 Z0\n",
+    })
+    tr.raise_for_status()
+    body = tr.json()
+    traj = body["event_trajectory"]
+    print("trajectory events:")
+    for e in traj:
+        print("  ", e["seq"], e["event_type"], "line", e["line_no"],
+              "tool", e["tool_no"], "r", e["tool_radius_mm"],
+              e["start_mm"], "->", e["end_mm"],
+              "kind", e["motion_kind"], "zone", e["hit_zone_no"])
+    # 初始刀位(seq=0) -> 静止换刀点(seq=1，先于同行运动) -> 运动(seq=2)
+    assert [e["event_type"] for e in traj] == \
+        ["initial", "tool_change", "motion"]
+    assert [e["seq"] for e in traj] == [0, 1, 2]
+    # 静止换刀点先命中；首碰撞即轨迹上首个 hit_zone_no 非空事件
+    first_hit = next(e for e in traj if e["hit_zone_no"] is not None)
+    assert first_hit["event_type"] == "tool_change"
+    assert (first_hit["line_no"], first_hit["tool_no"],
+            first_hit["tool_radius_mm"]) == (1, 1, 2.0)
+    assert (body["collision_line_no"], body["collision_tool_no"],
+            body["collision_tool_radius_mm"]) == (1, 1, 2.0)
+    # 轨迹随报告固化：GET 一致；禁区出新版本也不改变
+    snap = c.get(f"/reports/{body['report_id']}").json()
+    assert snap["event_trajectory"] == traj
+    print("trajectory frozen in report", body["report_id"])
 
 
 if __name__ == "__main__":
